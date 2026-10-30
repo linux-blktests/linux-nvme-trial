@@ -2720,7 +2720,7 @@ static int nvme_init_dma_buf_io_ctx(struct block_device *bdev,
 	struct nvme_ctrl *ctrl = ns->ctrl;
 
 	if (!ctrl->ops->init_dma_buf_io_ctx)
-		return -EINVAL;
+		return -EOPNOTSUPP;
 	return ctrl->ops->init_dma_buf_io_ctx(ctrl, ctx);
 }
 
