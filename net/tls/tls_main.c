@@ -31,6 +31,8 @@
  * SOFTWARE.
  */
 
+#include <crypto/sha2.h>
+#include <crypto/utils.h>
 #include <linux/module.h>
 
 #include <net/tcp.h>
@@ -325,6 +327,8 @@ void tls_ctx_free(struct sock *sk, struct tls_context *ctx)
 
 	memzero_explicit(&ctx->crypto_send, sizeof(ctx->crypto_send));
 	memzero_explicit(&ctx->crypto_recv, sizeof(ctx->crypto_recv));
+	memzero_explicit(&ctx->tx_secret, sizeof(ctx->tx_secret));
+	memzero_explicit(&ctx->rx_secret, sizeof(ctx->rx_secret));
 	mutex_destroy(&ctx->tx_lock);
 
 	if (sk)
@@ -757,8 +761,20 @@ static int do_tls_setsockopt_conf(struct sock *sk, sockptr_t optval,
 		ctx->rx_conf = conf;
 	update_sk_prot(sk, ctx);
 
-	if (update)
+	if (update) {
+		/* The registered secret no longer matches the key. The RX
+		 * secret also needs the TX one, see do_tls_setsockopt_secret().
+		 */
+		if (tx) {
+			memzero_explicit(&ctx->tx_secret,
+					 sizeof(ctx->tx_secret));
+			ctx->tx_key_update_reply = false;
+		}
+		memzero_explicit(&ctx->rx_secret, sizeof(ctx->rx_secret));
+		/* the answer now goes to user space */
+		ctx->tx_key_update_asked = false;
 		return 0;
+	}
 
 	if (tx) {
 		ctx->sk_write_space = sk->sk_write_space;
@@ -857,6 +873,159 @@ static int do_tls_setsockopt_tx_payload_len(struct sock *sk, sockptr_t optval,
 	return 0;
 }
 
+/* Length of the TLS 1.3 traffic secret for @cipher_type, the size of
+ * its hash. 0 if KeyUpdate is not supported for the cipher.
+ */
+static int tls_traffic_secret_len(u16 cipher_type)
+{
+	switch (cipher_type) {
+	case TLS_CIPHER_AES_GCM_128:
+	case TLS_CIPHER_AES_CCM_128:
+	case TLS_CIPHER_CHACHA20_POLY1305:
+		return SHA256_DIGEST_SIZE;
+	case TLS_CIPHER_AES_GCM_256:
+		return SHA384_DIGEST_SIZE;
+	default:
+		return 0;
+	}
+}
+
+/* The installed key and IV must be the ones that @secret gives
+ * (RFC 9846 section 7.3):
+ *
+ *   key = HKDF-Expand-Label(secret, "key", "", key_length)
+ *   iv  = HKDF-Expand-Label(secret, "iv", "", iv_length)
+ *
+ * crypto_info holds the iv as salt followed by iv. Each KeyUpdate
+ * derives the next key from the secret, so a wrong secret fails only
+ * at the first KeyUpdate, with no clear cause.
+ */
+static int tls_check_traffic_secret(struct tls_crypto_info *crypto_info,
+				    const u8 *secret, int len)
+{
+	const struct tls_cipher_desc *cipher_desc;
+	u8 iv[TLS_MAX_SALT_SIZE + TLS_MAX_IV_SIZE];
+	u8 key[TLS_CIPHER_AES_GCM_256_KEY_SIZE];
+	int rc;
+
+	cipher_desc = get_cipher_desc(crypto_info->cipher_type);
+	if (!cipher_desc || cipher_desc->key > sizeof(key) ||
+	    cipher_desc->salt + cipher_desc->iv > sizeof(iv))
+		return -EINVAL;
+
+	rc = tls_hkdf_expand_label(secret, len, "key", key, cipher_desc->key);
+	if (rc)
+		goto out;
+
+	rc = tls_hkdf_expand_label(secret, len, "iv", iv,
+				   cipher_desc->salt + cipher_desc->iv);
+	if (rc)
+		goto out;
+
+	if (crypto_memneq(key, crypto_info_key(crypto_info, cipher_desc),
+			  cipher_desc->key) ||
+	    crypto_memneq(iv, crypto_info_salt(crypto_info, cipher_desc),
+			  cipher_desc->salt) ||
+	    crypto_memneq(iv + cipher_desc->salt,
+			  crypto_info_iv(crypto_info, cipher_desc),
+			  cipher_desc->iv))
+		rc = -EINVAL;
+
+out:
+	memzero_explicit(key, sizeof(key));
+	memzero_explicit(iv, sizeof(iv));
+
+	return rc;
+}
+
+static int do_tls_setsockopt_secret(struct sock *sk, sockptr_t optval,
+				    unsigned int optlen, int tx)
+{
+	struct tls_context *ctx = tls_get_ctx(sk);
+	struct tls_crypto_info *crypto_info;
+	struct tls_traffic_secret *secret;
+	u8 data[TLS_MAX_TRAFFIC_SECRET_SIZE];
+	int len, rc;
+
+	if (tx) {
+		crypto_info = &ctx->crypto_send.info;
+		secret = &ctx->tx_secret;
+	} else {
+		crypto_info = &ctx->crypto_recv.info;
+		secret = &ctx->rx_secret;
+	}
+
+	/* The key must be installed first: its cipher selects the hash */
+	if (!TLS_CRYPTO_INFO_READY(crypto_info) ||
+	    crypto_info->version != TLS_1_3_VERSION)
+		return -EINVAL;
+
+	if ((tx ? ctx->tx_conf : ctx->rx_conf) != TLS_SW)
+		return -EOPNOTSUPP;
+
+	len = tls_traffic_secret_len(crypto_info->cipher_type);
+	if (!len)
+		return -EOPNOTSUPP;
+
+	if (sockptr_is_null(optval) || optlen != len)
+		return -EINVAL;
+
+	/* A received KeyUpdate may ask for one in reply. The kernel
+	 * consumes the record, so only the kernel can send the reply.
+	 */
+	if (!tx && !ctx->tx_secret.len)
+		return -EINVAL;
+
+	if (secret->len)
+		return -EBUSY;
+
+	if (copy_from_sockptr(data, optval, len)) {
+		rc = -EFAULT;
+		goto out;
+	}
+
+	rc = tls_check_traffic_secret(crypto_info, data, len);
+	if (rc)
+		goto out;
+
+	memcpy(secret->data, data, len);
+	secret->len = len;
+
+out:
+	memzero_explicit(data, sizeof(data));
+
+	return rc;
+}
+
+static int do_tls_setsockopt_key_update(struct sock *sk, sockptr_t optval,
+					unsigned int optlen)
+{
+	struct tls_context *ctx = tls_get_ctx(sk);
+	int value, rc;
+
+	if (sockptr_is_null(optval) || optlen != sizeof(value))
+		return -EINVAL;
+
+	if (copy_from_sockptr(&value, optval, sizeof(value)))
+		return -EFAULT;
+
+	if (value != 0 && value != 1)
+		return -EINVAL;
+
+	rc = mutex_lock_interruptible(&ctx->tx_lock);
+	if (rc)
+		return rc;
+	lock_sock(sk);
+	if (ctx->tx_conf == TLS_SW)
+		rc = tls_sw_key_update(sk, value);
+	else
+		rc = -EINVAL;
+	release_sock(sk);
+	mutex_unlock(&ctx->tx_lock);
+
+	return rc;
+}
+
 static int do_tls_setsockopt(struct sock *sk, int optname, sockptr_t optval,
 			     unsigned int optlen)
 {
@@ -882,6 +1051,16 @@ static int do_tls_setsockopt(struct sock *sk, int optname, sockptr_t optval,
 		lock_sock(sk);
 		rc = do_tls_setsockopt_tx_payload_len(sk, optval, optlen);
 		release_sock(sk);
+		break;
+	case TLS_TX_TRAFFIC_SECRET:
+	case TLS_RX_TRAFFIC_SECRET:
+		lock_sock(sk);
+		rc = do_tls_setsockopt_secret(sk, optval, optlen,
+					      optname == TLS_TX_TRAFFIC_SECRET);
+		release_sock(sk);
+		break;
+	case TLS_TX_KEY_UPDATE:
+		rc = do_tls_setsockopt_key_update(sk, optval, optlen);
 		break;
 	default:
 		rc = -ENOPROTOOPT;
