@@ -5183,6 +5183,12 @@ void nvme_uninit_ctrl(struct nvme_ctrl *ctrl)
 {
 	nvme_stop_keep_alive(ctrl);
 	nvme_hwmon_exit(ctrl);
+	/* transports remove their queue directories before this point */
+	if (ctrl->queues_kobj) {
+		kobject_del(ctrl->queues_kobj);
+		kobject_put(ctrl->queues_kobj);
+		ctrl->queues_kobj = NULL;
+	}
 	nvme_fault_inject_fini(&ctrl->fault_inject);
 	dev_pm_qos_hide_latency_tolerance(ctrl->device);
 	cdev_device_del(&ctrl->cdev, ctrl->device);
