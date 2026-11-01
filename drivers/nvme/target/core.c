@@ -29,6 +29,7 @@ struct workqueue_struct *nvmet_wq;
 EXPORT_SYMBOL_GPL(nvmet_wq);
 struct workqueue_struct *nvmet_aen_wq;
 EXPORT_SYMBOL_GPL(nvmet_aen_wq);
+struct workqueue_struct *nvmet_pr_wq;
 
 /*
  * This read/write semaphore is used to synchronize access to configuration
@@ -1175,7 +1176,7 @@ static u16 nvmet_parse_io_cmd(struct nvmet_req *req)
 		if (ret)
 			return ret;
 
-		ret = nvmet_pr_get_ns_pc_ref(req);
+		nvmet_pr_set_execute(req);
 	}
 	return ret;
 }
@@ -1510,6 +1511,11 @@ struct nvmet_ctrl *nvmet_ctrl_find_get(const char *subsysnqn,
 		if (ctrl->cntlid == cntlid) {
 			if (strncmp(hostnqn, ctrl->hostnqn, NVMF_NQN_SIZE)) {
 				pr_warn("hostnqn mismatch.\n");
+				continue;
+			}
+			/* All queues of a controller come in by its port. */
+			if (ctrl->port != req->port || ctrl->ops != req->ops) {
+				pr_warn("port mismatch.\n");
 				continue;
 			}
 			if (!kref_get_unless_zero(&ctrl->ref))
@@ -2013,9 +2019,14 @@ static int __init nvmet_init(void)
 	if (!nvmet_aen_wq)
 		goto out_free_nvmet_work_queue;
 
+	nvmet_pr_wq = alloc_workqueue("nvmet-pr-wq",
+				      WQ_MEM_RECLAIM | WQ_UNBOUND, 0);
+	if (!nvmet_pr_wq)
+		goto out_free_nvmet_aen_work_queue;
+
 	error = nvmet_init_debugfs();
 	if (error)
-		goto out_free_nvmet_aen_work_queue;
+		goto out_free_nvmet_pr_work_queue;
 
 	error = nvmet_init_discovery();
 	if (error)
@@ -2031,6 +2042,8 @@ out_exit_discovery:
 	nvmet_exit_discovery();
 out_exit_debugfs:
 	nvmet_exit_debugfs();
+out_free_nvmet_pr_work_queue:
+	destroy_workqueue(nvmet_pr_wq);
 out_free_nvmet_aen_work_queue:
 	destroy_workqueue(nvmet_aen_wq);
 out_free_nvmet_work_queue:
@@ -2050,6 +2063,7 @@ static void __exit nvmet_exit(void)
 	nvmet_exit_discovery();
 	nvmet_exit_debugfs();
 	ida_destroy(&cntlid_ida);
+	destroy_workqueue(nvmet_pr_wq);
 	destroy_workqueue(nvmet_aen_wq);
 	destroy_workqueue(nvmet_wq);
 	destroy_workqueue(buffered_io_wq);

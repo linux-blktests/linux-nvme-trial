@@ -88,6 +88,8 @@ struct nvmet_pr {
 	 */
 	struct semaphore	pr_sem;
 	struct list_head	registrant_list;
+	/* The pc_refs that a running "preempt and abort" has killed. */
+	struct list_head	abort_list;
 };
 
 struct nvmet_pr_per_ctrl_ref {
@@ -95,6 +97,9 @@ struct nvmet_pr_per_ctrl_ref {
 	struct completion	free_done;
 	struct completion	confirm_done;
 	uuid_t			hostid;
+	/* Both are written under the lock of ns->pr_per_ctrl_refs. */
+	struct list_head	abort_entry;
+	bool			ctrl_gone;
 };
 
 struct nvmet_ns {
@@ -508,6 +513,8 @@ struct nvmet_req {
 	struct nvmet_port	*port;
 
 	void (*execute)(struct nvmet_req *req);
+	/* what nvmet_pr_execute_io() calls once it has the pc_ref */
+	void (*pr_execute)(struct nvmet_req *req);
 	const struct nvmet_fabrics_ops *ops;
 
 	struct pci_dev		*p2p_dev;
@@ -523,6 +530,7 @@ extern struct workqueue_struct *buffered_io_wq;
 extern struct workqueue_struct *zbd_wq;
 extern struct workqueue_struct *nvmet_wq;
 extern struct workqueue_struct *nvmet_aen_wq;
+extern struct workqueue_struct *nvmet_pr_wq;
 
 static inline void nvmet_set_result(struct nvmet_req *req, u32 result)
 {
@@ -1035,7 +1043,7 @@ void nvmet_pr_exit_ns(struct nvmet_ns *ns);
 void nvmet_execute_get_log_page_resv(struct nvmet_req *req);
 u16 nvmet_set_feat_resv_notif_mask(struct nvmet_req *req, u32 mask);
 u16 nvmet_get_feat_resv_notif_mask(struct nvmet_req *req);
-u16 nvmet_pr_get_ns_pc_ref(struct nvmet_req *req);
+void nvmet_pr_set_execute(struct nvmet_req *req);
 static inline void nvmet_pr_put_ns_pc_ref(struct nvmet_pr_per_ctrl_ref *pc_ref)
 {
 	percpu_ref_put(&pc_ref->ref);
