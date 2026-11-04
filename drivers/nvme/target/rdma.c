@@ -77,6 +77,8 @@ struct nvmet_rdma_rsp {
 	u32			invalidate_rkey;
 
 	struct list_head	wait_list;
+	/* set under rsp_wr_wait_lock while the wait list's loop executes us */
+	bool			*wait_released;
 	int			tag;
 };
 
@@ -511,25 +513,53 @@ static int nvmet_rdma_post_recv(struct nvmet_rdma_device *ndev,
 	return ret;
 }
 
-static void nvmet_rdma_process_wr_wait_list(struct nvmet_rdma_queue *queue)
+static void nvmet_rdma_process_wr_wait_list(struct nvmet_rdma_queue *queue,
+					    struct nvmet_rdma_rsp *done)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&queue->rsp_wr_wait_lock, flags);
+	if (done && done->wait_released) {
+		/*
+		 * The loop below has not come back from this command yet. It is
+		 * further up this stack if the command completed in place and
+		 * its response could not be posted. Otherwise it runs in
+		 * another context. It goes on with the list, so leave the list
+		 * to it.
+		 */
+		*done->wait_released = true;
+		WRITE_ONCE(done->wait_released, NULL);
+		spin_unlock_irqrestore(&queue->rsp_wr_wait_lock, flags);
+		return;
+	}
 	while (!list_empty(&queue->rsp_wr_wait_list)) {
 		struct nvmet_rdma_rsp *rsp;
+		bool released = false;
 		bool ret;
 
 		rsp = list_entry(queue->rsp_wr_wait_list.next,
 				struct nvmet_rdma_rsp, wait_list);
 		list_del(&rsp->wait_list);
+		rsp->wait_released = &released;
 
 		spin_unlock_irqrestore(&queue->rsp_wr_wait_lock, flags);
 		ret = nvmet_rdma_execute_command(rsp);
 		spin_lock_irqsave(&queue->rsp_wr_wait_lock, flags);
 
+		/* A released response can be freed, or in use again. */
+		if (!released)
+			WRITE_ONCE(rsp->wait_released, NULL);
 		if (!ret) {
 			list_add(&rsp->wait_list, &queue->rsp_wr_wait_list);
+			/*
+			 * A release that came while the command was off the
+			 * list can have seen an empty list, so look at the
+			 * room again.
+			 * Pairs with the barrier in nvmet_rdma_release_rsp().
+			 */
+			smp_mb();
+			if (atomic_read(&queue->sq_wr_avail) > rsp->n_rdma)
+				continue;
 			break;
 		}
 	}
@@ -677,11 +707,17 @@ static void nvmet_rdma_release_rsp(struct nvmet_rdma_rsp *rsp)
 	struct nvmet_rdma_queue *queue = rsp->queue;
 
 	atomic_add(1 + rsp->n_rdma, &queue->sq_wr_avail);
+	/*
+	 * Give the room back ahead of the look at the wait list below.
+	 * Pairs with the smp_mb() in nvmet_rdma_process_wr_wait_list().
+	 */
+	smp_mb__after_atomic();
 
 	nvmet_rdma_free_rsp_resources(rsp);
 
-	if (unlikely(!list_empty_careful(&queue->rsp_wr_wait_list)))
-		nvmet_rdma_process_wr_wait_list(queue);
+	if (unlikely(READ_ONCE(rsp->wait_released) ||
+		     !list_empty_careful(&queue->rsp_wr_wait_list)))
+		nvmet_rdma_process_wr_wait_list(queue, rsp);
 
 	nvmet_rdma_put_rsp(rsp);
 }
@@ -1003,6 +1039,8 @@ static void nvmet_rdma_handle_command(struct nvmet_rdma_queue *queue,
 		spin_lock_irqsave(&queue->rsp_wr_wait_lock, flags);
 		list_add_tail(&cmd->wait_list, &queue->rsp_wr_wait_list);
 		spin_unlock_irqrestore(&queue->rsp_wr_wait_lock, flags);
+		/* The last response may have been released in between. */
+		nvmet_rdma_process_wr_wait_list(queue, NULL);
 	}
 
 	return;
@@ -1197,12 +1235,16 @@ static void nvmet_rdma_free_dev(struct kref *ref)
 	struct nvmet_rdma_device *ndev =
 		container_of(ref, struct nvmet_rdma_device, ref);
 
+	nvmet_rdma_destroy_srqs(ndev);
+	ib_dealloc_pd(ndev->pd);
+
+	/*
+	 * Not earlier: nvmet_rdma_remove_one() waits for the release work that
+	 * got here only if it finds the device on the list.
+	 */
 	mutex_lock(&device_list_mutex);
 	list_del(&ndev->entry);
 	mutex_unlock(&device_list_mutex);
-
-	nvmet_rdma_destroy_srqs(ndev);
-	ib_dealloc_pd(ndev->pd);
 
 	kfree(ndev);
 }
@@ -1289,8 +1331,17 @@ static int nvmet_rdma_create_queue_ib(struct nvmet_rdma_queue *queue)
 	 */
 	nr_cqe = queue->recv_queue_size + 2 * queue->send_queue_size;
 
-	queue->cq = ib_cq_pool_get(ndev->device, nr_cqe + 1,
-				   queue->comp_vector, IB_POLL_WORKQUEUE);
+	/*
+	 * The host picks both sizes. Never ask ib_cq_pool_get() for more
+	 * entries than one CQ of the device can have: no CQ would ever fit,
+	 * and it would allocate new CQs until an allocation fails.
+	 */
+	if (nr_cqe + 1 > ndev->device->attrs.max_cqe)
+		queue->cq = ERR_PTR(-EINVAL);
+	else
+		queue->cq = ib_cq_pool_get(ndev->device, nr_cqe + 1,
+					   queue->comp_vector,
+					   IB_POLL_WORKQUEUE);
 	if (IS_ERR(queue->cq)) {
 		ret = PTR_ERR(queue->cq);
 		pr_err("failed to create CQ cqe= %d ret= %d\n",
@@ -1694,7 +1745,7 @@ out_unlock:
 
 static void __nvmet_rdma_queue_disconnect(struct nvmet_rdma_queue *queue)
 {
-	bool disconnect = false;
+	bool disconnect = false, live = false;
 	unsigned long flags;
 
 	pr_debug("cm_id= %p queue->state= %d\n", queue->cm_id, queue->state);
@@ -1713,6 +1764,7 @@ static void __nvmet_rdma_queue_disconnect(struct nvmet_rdma_queue *queue)
 		}
 		fallthrough;
 	case NVMET_RDMA_Q_LIVE:
+		live = queue->state == NVMET_RDMA_Q_LIVE;
 		queue->state = NVMET_RDMA_Q_DISCONNECTING;
 		disconnect = true;
 		break;
@@ -1722,38 +1774,47 @@ static void __nvmet_rdma_queue_disconnect(struct nvmet_rdma_queue *queue)
 	spin_unlock_irqrestore(&queue->state_lock, flags);
 
 	if (disconnect) {
-		rdma_disconnect(queue->cm_id);
+		/*
+		 * Over iWARP rdma_disconnect() sleeps until the CM has handled
+		 * the ESTABLISHED event of this connection. The CM handles the
+		 * events of all connections one at a time, and our handler
+		 * takes nvmet_rdma_queue_mutex, which callers of this function
+		 * hold. So a queue that has not seen the event is left to the
+		 * release work: ib_drain_qp() moves the queue pair to the error
+		 * state, which ends the connection.
+		 */
+		if (live)
+			rdma_disconnect(queue->cm_id);
 		queue_work(nvmet_wq, &queue->release_work);
 	}
 }
 
 static void nvmet_rdma_queue_disconnect(struct nvmet_rdma_queue *queue)
 {
-	bool disconnect = false;
-
+	/*
+	 * The release work is queued with the mutex held, so that
+	 * nvmet_rdma_remove_one() finds the queue on the list or its work on
+	 * the workqueue.
+	 */
 	mutex_lock(&nvmet_rdma_queue_mutex);
 	if (!list_empty(&queue->queue_list)) {
 		list_del_init(&queue->queue_list);
-		disconnect = true;
+		__nvmet_rdma_queue_disconnect(queue);
 	}
 	mutex_unlock(&nvmet_rdma_queue_mutex);
-
-	if (disconnect)
-		__nvmet_rdma_queue_disconnect(queue);
 }
 
 static void nvmet_rdma_queue_connect_fail(struct rdma_cm_id *cm_id,
 		struct nvmet_rdma_queue *queue)
 {
-	WARN_ON_ONCE(queue->state != NVMET_RDMA_Q_CONNECTING);
-
-	mutex_lock(&nvmet_rdma_queue_mutex);
-	if (!list_empty(&queue->queue_list))
-		list_del_init(&queue->queue_list);
-	mutex_unlock(&nvmet_rdma_queue_mutex);
-
 	pr_err("failed to connect queue %d\n", queue->idx);
-	queue_work(nvmet_wq, &queue->release_work);
+
+	/*
+	 * The peer decides when these events arrive: a REJ is also delivered
+	 * for a connection that is established, or that we are disconnecting.
+	 * Whoever takes the queue off the list queues release_work, once.
+	 */
+	nvmet_rdma_queue_disconnect(queue);
 }
 
 /**
@@ -1766,10 +1827,13 @@ static void nvmet_rdma_queue_connect_fail(struct rdma_cm_id *cm_id,
  * queue cm_id and/or a device bound listener cm_id (where in this
  * case queue will be null).
  *
- * We registered an ib_client to handle device removal for queues,
- * so we only need to handle the listening port cm_ids. In this case
- * we nullify the priv to prevent double cm_id destruction and destroying
- * the cm_id implicitly by returning a non-zero rc to the callout.
+ * The RDMA CM waits until each cm_id of the device is destroyed, so a queue
+ * has to go now. Our ib_client also removes the queues, but it cannot be
+ * relied on here: built in, it is called after the RDMA CM's client.
+ *
+ * For a listening port cm_id we nullify the priv to prevent double cm_id
+ * destruction and destroying the cm_id implicitly by returning a non-zero
+ * rc to the callout.
  */
 static int nvmet_rdma_device_removal(struct rdma_cm_id *cm_id,
 		struct nvmet_rdma_queue *queue)
@@ -1777,11 +1841,7 @@ static int nvmet_rdma_device_removal(struct rdma_cm_id *cm_id,
 	struct nvmet_rdma_port *port;
 
 	if (queue) {
-		/*
-		 * This is a queue cm_id. we have registered
-		 * an ib_client to handle queues removal
-		 * so don't interfere and just return.
-		 */
+		nvmet_rdma_queue_disconnect(queue);
 		return 0;
 	}
 
