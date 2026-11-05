@@ -176,16 +176,29 @@ static void nvmet_execute_get_log_page_error(struct nvmet_req *req)
 {
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
 	unsigned long flags;
-	off_t offset = 0;
+	u32 offset = 0;
+	u32 len;
 	u64 slot;
 	u64 i;
+	u16 status = 0;
+
+	len = min_t(u32, req->transfer_len,
+		    NVMET_ERROR_LOG_SLOTS * sizeof(struct nvme_error_slot));
 
 	spin_lock_irqsave(&ctrl->error_lock, flags);
+
+	/*
+	 * The NVMe base specification requires the most recent error to be
+	 * the first log entry, so walk the ring backwards from the slot of
+	 * the last error and stop at the end of the requested buffer.
+	 */
 	slot = ctrl->err_counter % NVMET_ERROR_LOG_SLOTS;
 
-	for (i = 0; i < NVMET_ERROR_LOG_SLOTS; i++) {
-		if (nvmet_copy_to_sgl(req, offset, &ctrl->slots[slot],
-				sizeof(struct nvme_error_slot)))
+	for (i = 0; i < NVMET_ERROR_LOG_SLOTS &&
+	     offset + sizeof(struct nvme_error_slot) <= len; i++) {
+		status = nvmet_copy_to_sgl(req, offset, &ctrl->slots[slot],
+					   sizeof(struct nvme_error_slot));
+		if (status)
 			break;
 
 		if (slot == 0)
@@ -195,7 +208,20 @@ static void nvmet_execute_get_log_page_error(struct nvmet_req *req)
 		offset += sizeof(struct nvme_error_slot);
 	}
 	spin_unlock_irqrestore(&ctrl->error_lock, flags);
-	nvmet_req_complete(req, 0);
+
+	/*
+	 * Zero what the ring walk did not fill: either the tail beyond the
+	 * fixed log, or the partial entry at the end of a short request.
+	 */
+	if (req->transfer_len > offset) {
+		u16 zero_status;
+
+		zero_status = nvmet_zero_sgl(req, offset,
+					     req->transfer_len - offset);
+		if (!status)
+			status = zero_status;
+	}
+	nvmet_req_complete(req, status);
 }
 
 static void nvmet_execute_get_supported_log_pages(struct nvmet_req *req)
@@ -222,6 +248,9 @@ static void nvmet_execute_get_supported_log_pages(struct nvmet_req *req)
 	logs->lids[NVME_LOG_RESERVATION] = cpu_to_le32(NVME_LIDS_LSUPP);
 
 	status = nvmet_copy_to_sgl(req, 0, logs, sizeof(*logs));
+	if (!status && req->transfer_len > sizeof(*logs))
+		status = nvmet_zero_sgl(req, sizeof(*logs),
+					req->transfer_len - sizeof(*logs));
 	kfree(logs);
 out:
 	nvmet_req_complete(req, status);
@@ -303,7 +332,7 @@ static void nvmet_execute_get_log_page_rmi(struct nvmet_req *req)
 		goto out;
 	}
 
-	if (req->transfer_len != sizeof(*log)) {
+	if (req->transfer_len < sizeof(*log)) {
 		status = NVME_SC_SGL_INVALID_DATA | NVME_STATUS_DNR;
 		goto out;
 	}
@@ -322,6 +351,9 @@ static void nvmet_execute_get_log_page_rmi(struct nvmet_req *req)
 		log->numa = cpu_to_le16(1);
 
 	status = nvmet_copy_to_sgl(req, 0, log, sizeof(*log));
+	if (!status && req->transfer_len > sizeof(*log))
+		status = nvmet_zero_sgl(req, sizeof(*log),
+					req->transfer_len - sizeof(*log));
 	kfree(log);
 out:
 	nvmet_req_complete(req, status);
@@ -437,6 +469,9 @@ static void nvmet_execute_get_log_cmd_effects_ns(struct nvmet_req *req)
 	}
 
 	status = nvmet_copy_to_sgl(req, 0, log, sizeof(*log));
+	if (!status && req->transfer_len > sizeof(*log))
+		status = nvmet_zero_sgl(req, sizeof(*log),
+					req->transfer_len - sizeof(*log));
 free:
 	kfree(log);
 out:
@@ -528,6 +563,9 @@ static void nvmet_execute_get_log_page_endgrp(struct nvmet_req *req)
 	put_unaligned_le64(data_units_written, &log->duw[0]);
 copy:
 	status = nvmet_copy_to_sgl(req, 0, log, sizeof(*log));
+	if (!status && req->transfer_len > sizeof(*log))
+		status = nvmet_zero_sgl(req, sizeof(*log),
+					req->transfer_len - sizeof(*log));
 	kfree(log);
 out:
 	nvmet_req_complete(req, status);
@@ -602,6 +640,9 @@ static void nvmet_execute_get_log_page_features(struct nvmet_req *req)
 		cpu_to_le32(NVME_FIS_FSUPP | NVME_FIS_NSCPE);
 
 	status = nvmet_copy_to_sgl(req, 0, features, sizeof(*features));
+	if (!status && req->transfer_len > sizeof(*features))
+		status = nvmet_zero_sgl(req, sizeof(*features),
+					req->transfer_len - sizeof(*features));
 	kfree(features);
 out:
 	nvmet_req_complete(req, status);

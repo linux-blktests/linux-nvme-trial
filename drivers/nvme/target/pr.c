@@ -130,6 +130,13 @@ void nvmet_execute_get_log_page_resv(struct nvmet_req *req)
 out:
 	status = nvmet_copy_to_sgl(req, 0, &log, sizeof(log));
 	mutex_unlock(&log_mgr->lock);
+	/*
+	 * Zero the unused tail outside the log_mgr lock: the host controls
+	 * the length, so this can touch a large buffer.
+	 */
+	if (!status && req->transfer_len > sizeof(log))
+		status = nvmet_zero_sgl(req, sizeof(log),
+					req->transfer_len - sizeof(log));
 	nvmet_req_complete(req, status);
 }
 
