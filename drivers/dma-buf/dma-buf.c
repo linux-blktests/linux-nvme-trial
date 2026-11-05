@@ -14,6 +14,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/dma-buf.h>
+#include <linux/dma-buf-mapping.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-fence-unwrap.h>
 #include <linux/anon_inodes.h>
@@ -677,7 +678,7 @@ err_alloc_file:
  *
  * 3. Once the buffer is attached to all devices userspace can initiate DMA
  *    access to the shared buffer. In the kernel this is done by calling
- *    dma_buf_map_attachment() and dma_buf_unmap_attachment().
+ *    dma_buf_map_sgt() and dma_buf_unmap_sgt().
  *
  * 4. Once a driver is done with a shared buffer it needs to call
  *    dma_buf_detach() (after cleaning up any mappings) and then release the
@@ -714,9 +715,11 @@ struct dma_buf *dma_buf_export(const struct dma_buf_export_info *exp_info)
 	int ret;
 
 	if (WARN_ON(!exp_info->priv || !exp_info->ops
-		    || !exp_info->ops->map_dma_buf
-		    || !exp_info->ops->unmap_dma_buf
 		    || !exp_info->ops->release))
+		return ERR_PTR(-EINVAL);
+
+	if (WARN_ON(!exp_info->ops->match_mapping &&
+		    !exp_info->ops->single_exporter_match))
 		return ERR_PTR(-EINVAL);
 
 	if (WARN_ON(!exp_info->ops->pin != !exp_info->ops->unpin))
@@ -955,8 +958,8 @@ dma_buf_pin_on_map(struct dma_buf_attachment *attach)
  *
  *     - dma_buf_pin()
  *     - dma_buf_unpin()
- *     - dma_buf_map_attachment()
- *     - dma_buf_unmap_attachment()
+ *     - dma_buf_map_sgt()
+ *     - dma_buf_unmap_sgt()
  *     - dma_buf_vmap()
  *     - dma_buf_vunmap()
  *
@@ -973,8 +976,8 @@ dma_buf_pin_on_map(struct dma_buf_attachment *attach)
  *     - dma_buf_mmap()
  *     - dma_buf_begin_cpu_access()
  *     - dma_buf_end_cpu_access()
- *     - dma_buf_map_attachment_unlocked()
- *     - dma_buf_unmap_attachment_unlocked()
+ *     - dma_buf_map_sgt_unlocked()
+ *     - dma_buf_unmap_sgt_unlocked()
  *     - dma_buf_vmap_unlocked()
  *     - dma_buf_vunmap_unlocked()
  *
@@ -1027,12 +1030,26 @@ dma_buf_pin_on_map(struct dma_buf_attachment *attach)
  * Note that this can fail if the backing storage of @dmabuf is in a place not
  * accessible to @dev, and cannot be moved to a more suitable place. This is
  * indicated with the error code -EBUSY.
+ *
+ * The mapping types the importer supports come from
+ * &dma_buf_attach_ops.supported_mapping_types. Importers without it, which
+ * includes every dma_buf_attach() caller, support only the SGT type, with
+ * P2P according to &dma_buf_attach_ops.allow_peer2peer. This records the
+ * attachment's match set, i.e. the intersection of types supported by both
+ * importer and exporter, in &dma_buf_attachment.matches. Later attachments
+ * by other importers never change the set but may affect what type the
+ * exporter selects when the attachment is first mapped or pinned.
  */
 struct dma_buf_attachment *
 dma_buf_dynamic_attach(struct dma_buf *dmabuf, struct device *dev,
 		       const struct dma_buf_attach_ops *importer_ops,
 		       void *importer_priv)
 {
+	struct dma_buf_mapping_match default_match;
+	struct dma_buf_match_args match_args = {
+		.dmabuf = dmabuf,
+		.dev = dev,
+	};
 	struct dma_buf_attachment *attach;
 	int ret;
 
@@ -1043,12 +1060,41 @@ dma_buf_dynamic_attach(struct dma_buf *dmabuf, struct device *dev,
 	if (!attach)
 		return ERR_PTR(-ENOMEM);
 
-	attach->dev = dev;
 	attach->dmabuf = dmabuf;
-	if (importer_ops)
-		attach->peer2peer = importer_ops->allow_peer2peer;
 	attach->importer_ops = importer_ops;
 	attach->importer_priv = importer_priv;
+
+	/*
+	 * The exporter's match_mapping() may look at the importer side of the
+	 * attachment, so initialise it before the match.
+	 */
+	match_args.attach = attach;
+	if (importer_ops && importer_ops->supported_mapping_types) {
+		if (WARN_ON(!importer_ops->nr_supported_mapping_types)) {
+			ret = -EINVAL;
+			goto err_attach;
+		}
+		match_args.imp_matches = importer_ops->supported_mapping_types;
+		match_args.imp_len = importer_ops->nr_supported_mapping_types;
+	} else {
+		default_match = DMA_BUF_IMAPPING_SGT(
+			importer_ops && importer_ops->allow_peer2peer ?
+				DMA_SGT_IMPORTER_ACCEPTS_P2P :
+				DMA_SGT_NO_P2P);
+		match_args.imp_matches = &default_match;
+		match_args.imp_len = 1;
+	}
+
+	if (dmabuf->ops->match_mapping) {
+		ret = dmabuf->ops->match_mapping(&match_args);
+		if (ret)
+			goto err_attach;
+	} else {
+		ret = dma_buf_match_mapping(
+			&match_args, dmabuf->ops->single_exporter_match, 1);
+		if (ret)
+			goto err_attach;
+	}
 
 	if (dmabuf->ops->attach) {
 		ret = dmabuf->ops->attach(dmabuf, attach);
@@ -1107,7 +1153,8 @@ void dma_buf_detach(struct dma_buf *dmabuf, struct dma_buf_attachment *attach)
 		dmabuf->ops->detach(dmabuf, attach);
 
 	DMA_BUF_TRACE(trace_dma_buf_detach, dmabuf, attach,
-		dma_buf_attachment_is_dynamic(attach), attach->dev);
+		dma_buf_attachment_is_dynamic(attach),
+		dma_buf_sgt_dma_device(attach));
 
 	kfree(attach);
 }
@@ -1130,14 +1177,22 @@ EXPORT_SYMBOL_NS_GPL(dma_buf_detach, "DMA_BUF");
 int dma_buf_pin(struct dma_buf_attachment *attach)
 {
 	struct dma_buf *dmabuf = attach->dmabuf;
+	bool selected = attach->selected;
 	int ret = 0;
 
 	WARN_ON(!attach->importer_ops);
 
 	dma_resv_assert_held(dmabuf->resv);
 
-	if (dmabuf->ops->pin)
+	ret = dma_buf_mapping_select(attach);
+	if (ret)
+		return ret;
+
+	if (dmabuf->ops->pin) {
 		ret = dmabuf->ops->pin(attach);
+		if (ret)
+			dma_buf_mapping_unselect(attach, selected);
+	}
 
 	return ret;
 }
@@ -1164,39 +1219,18 @@ void dma_buf_unpin(struct dma_buf_attachment *attach)
 }
 EXPORT_SYMBOL_NS_GPL(dma_buf_unpin, "DMA_BUF");
 
-/**
- * dma_buf_map_attachment - Returns the scatterlist table of the attachment;
- * mapped into _device_ address space. Is a wrapper for map_dma_buf() of the
- * dma_buf_ops.
- * @attach:	[in]	attachment whose scatterlist is to be returned
- * @direction:	[in]	direction of DMA transfer
- *
- * Returns sg_table containing the scatterlist to be returned; returns ERR_PTR
- * on error. May return -EINTR if it is interrupted by a signal.
- *
- * On success, the DMA addresses and lengths in the returned scatterlist are
- * PAGE_SIZE aligned.
- *
- * A mapping must be unmapped by using dma_buf_unmap_attachment(). Note that
- * the underlying backing storage is pinned for as long as a mapping exists,
- * therefore users/importers should not hold onto a mapping for undue amounts of
- * time.
- *
- * Important: Dynamic importers must wait for the exclusive fence of the struct
- * dma_resv attached to the DMA-BUF first.
- */
-struct sg_table *dma_buf_map_attachment(struct dma_buf_attachment *attach,
-					enum dma_data_direction direction)
+/* The SGT type must have been selected for the attachment already */
+static struct sg_table *
+__dma_buf_map_sgt(struct dma_buf_attachment *attach,
+		  enum dma_data_direction direction)
 {
+	const struct dma_buf_mapping_sgt_exp_ops *sgt_exp_ops =
+		dma_buf_get_sgt_ops(attach);
 	struct sg_table *sg_table;
 	signed long ret;
 
-	might_sleep();
-
-	if (WARN_ON(!attach || !attach->dmabuf))
+	if (WARN_ON(!sgt_exp_ops))
 		return ERR_PTR(-EINVAL);
-
-	dma_resv_assert_held(attach->dmabuf->resv);
 
 	if (dma_buf_pin_on_map(attach)) {
 		ret = attach->dmabuf->ops->pin(attach);
@@ -1209,7 +1243,7 @@ struct sg_table *dma_buf_map_attachment(struct dma_buf_attachment *attach,
 			return ERR_PTR(ret);
 	}
 
-	sg_table = attach->dmabuf->ops->map_dma_buf(attach, direction);
+	sg_table = sgt_exp_ops->map_dma_buf(attach, direction);
 	if (!sg_table)
 		sg_table = ERR_PTR(-ENOMEM);
 	if (IS_ERR(sg_table))
@@ -1248,7 +1282,7 @@ struct sg_table *dma_buf_map_attachment(struct dma_buf_attachment *attach,
 	return sg_table;
 
 error_unmap:
-	attach->dmabuf->ops->unmap_dma_buf(attach, sg_table, direction);
+	sgt_exp_ops->unmap_dma_buf(attach, sg_table, direction);
 	sg_table = ERR_PTR(ret);
 
 error_unpin:
@@ -1257,20 +1291,100 @@ error_unpin:
 
 	return sg_table;
 }
-EXPORT_SYMBOL_NS_GPL(dma_buf_map_attachment, "DMA_BUF");
 
 /**
- * dma_buf_map_attachment_unlocked - Returns the scatterlist table of the attachment;
+ * dma_buf_map_sgt - Returns the scatterlist table of the attachment;
  * mapped into _device_ address space. Is a wrapper for map_dma_buf() of the
  * dma_buf_ops.
  * @attach:	[in]	attachment whose scatterlist is to be returned
  * @direction:	[in]	direction of DMA transfer
  *
- * Unlocked variant of dma_buf_map_attachment().
+ * Returns sg_table containing the scatterlist to be returned; returns ERR_PTR
+ * on error. May return -EINTR if it is interrupted by a signal.
+ *
+ * On success, the DMA addresses and lengths in the returned scatterlist are
+ * PAGE_SIZE aligned.
+ *
+ * A mapping must be unmapped by using dma_buf_unmap_sgt(). Note that
+ * the underlying backing storage is pinned for as long as a mapping exists,
+ * therefore users/importers should not hold onto a mapping for undue amounts of
+ * time.
+ *
+ * Important: Dynamic importers must wait for the exclusive fence of the struct
+ * dma_resv attached to the DMA-BUF first.
+ */
+struct sg_table *dma_buf_map_sgt(struct dma_buf_attachment *attach,
+				 enum dma_data_direction direction)
+{
+	struct sg_table *sg_table;
+	bool selected;
+	int ret;
+
+	might_sleep();
+
+	if (WARN_ON(!attach || !attach->dmabuf))
+		return ERR_PTR(-EINVAL);
+
+	dma_resv_assert_held(attach->dmabuf->resv);
+
+	selected = attach->selected;
+	ret = dma_buf_mapping_select(attach);
+	if (ret)
+		return ERR_PTR(ret);
+
+	sg_table = __dma_buf_map_sgt(attach, direction);
+	if (IS_ERR(sg_table))
+		dma_buf_mapping_unselect(attach, selected);
+
+	return sg_table;
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_map_sgt, "DMA_BUF");
+
+/* &dma_buf_mapping_type.map / .unmap for the SGT type */
+struct dma_buf_mapping *dma_buf_sgt_type_map(struct dma_buf_attachment *attach,
+					     enum dma_data_direction dir)
+{
+	struct dma_buf_sgt_mapping *mapping;
+	int ret;
+
+	mapping = kzalloc_obj(*mapping);
+	if (!mapping)
+		return ERR_PTR(-ENOMEM);
+
+	mapping->base.type = &dma_buf_mapping_sgt_type;
+	mapping->sgt = __dma_buf_map_sgt(attach, dir);
+	if (IS_ERR(mapping->sgt)) {
+		ret = PTR_ERR(mapping->sgt);
+		kfree(mapping);
+		return ERR_PTR(ret);
+	}
+
+	return &mapping->base;
+}
+
+void dma_buf_sgt_type_unmap(struct dma_buf_attachment *attach,
+			    struct dma_buf_mapping *base,
+			    enum dma_data_direction dir)
+{
+	struct dma_buf_sgt_mapping *mapping =
+		container_of(base, struct dma_buf_sgt_mapping, base);
+
+	dma_buf_unmap_sgt(attach, mapping->sgt, dir);
+	kfree(mapping);
+}
+
+/**
+ * dma_buf_map_sgt_unlocked - Returns the scatterlist table of the attachment;
+ * mapped into _device_ address space. Is a wrapper for map_dma_buf() of the
+ * dma_buf_ops.
+ * @attach:	[in]	attachment whose scatterlist is to be returned
+ * @direction:	[in]	direction of DMA transfer
+ *
+ * Unlocked variant of dma_buf_map_sgt().
  */
 struct sg_table *
-dma_buf_map_attachment_unlocked(struct dma_buf_attachment *attach,
-				enum dma_data_direction direction)
+dma_buf_map_sgt_unlocked(struct dma_buf_attachment *attach,
+			 enum dma_data_direction direction)
 {
 	struct sg_table *sg_table;
 
@@ -1280,24 +1394,59 @@ dma_buf_map_attachment_unlocked(struct dma_buf_attachment *attach,
 		return ERR_PTR(-EINVAL);
 
 	dma_resv_lock(attach->dmabuf->resv, NULL);
-	sg_table = dma_buf_map_attachment(attach, direction);
+	sg_table = dma_buf_map_sgt(attach, direction);
 	dma_resv_unlock(attach->dmabuf->resv);
 
 	return sg_table;
 }
-EXPORT_SYMBOL_NS_GPL(dma_buf_map_attachment_unlocked, "DMA_BUF");
+EXPORT_SYMBOL_NS_GPL(dma_buf_map_sgt_unlocked, "DMA_BUF");
 
 /**
- * dma_buf_unmap_attachment - unmaps and decreases usecount of the buffer;might
+ * dma_buf_unmap_sgt - unmaps and decreases usecount of the buffer;might
  * deallocate the scatterlist associated. Is a wrapper for unmap_dma_buf() of
  * dma_buf_ops.
  * @attach:	[in]	attachment to unmap buffer from
  * @sg_table:	[in]	scatterlist info of the buffer to unmap
  * @direction:  [in]    direction of DMA transfer
  *
- * This unmaps a DMA mapping for @attached obtained by dma_buf_map_attachment().
+ * This unmaps a DMA mapping for @attached obtained by dma_buf_map_sgt().
  */
-void dma_buf_unmap_attachment(struct dma_buf_attachment *attach,
+void dma_buf_unmap_sgt(struct dma_buf_attachment *attach,
+				struct sg_table *sg_table,
+				enum dma_data_direction direction)
+{
+	const struct dma_buf_mapping_sgt_exp_ops *sgt_exp_ops;
+
+	might_sleep();
+
+	if (WARN_ON(!attach || !attach->dmabuf || !sg_table))
+		return;
+
+	sgt_exp_ops = dma_buf_get_sgt_ops(attach);
+	if (WARN_ON(!sgt_exp_ops))
+		return;
+
+	dma_resv_assert_held(attach->dmabuf->resv);
+
+	dma_buf_unwrap_sg_table(&sg_table);
+	sgt_exp_ops->unmap_dma_buf(attach, sg_table, direction);
+
+	if (dma_buf_pin_on_map(attach))
+		attach->dmabuf->ops->unpin(attach);
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_unmap_sgt, "DMA_BUF");
+
+/**
+ * dma_buf_unmap_sgt_unlocked - unmaps and decreases usecount of the buffer;might
+ * deallocate the scatterlist associated. Is a wrapper for unmap_dma_buf() of
+ * dma_buf_ops.
+ * @attach:	[in]	attachment to unmap buffer from
+ * @sg_table:	[in]	scatterlist info of the buffer to unmap
+ * @direction:	[in]	direction of DMA transfer
+ *
+ * Unlocked variant of dma_buf_unmap_sgt().
+ */
+void dma_buf_unmap_sgt_unlocked(struct dma_buf_attachment *attach,
 				struct sg_table *sg_table,
 				enum dma_data_direction direction)
 {
@@ -1306,40 +1455,11 @@ void dma_buf_unmap_attachment(struct dma_buf_attachment *attach,
 	if (WARN_ON(!attach || !attach->dmabuf || !sg_table))
 		return;
 
-	dma_resv_assert_held(attach->dmabuf->resv);
-
-	dma_buf_unwrap_sg_table(&sg_table);
-	attach->dmabuf->ops->unmap_dma_buf(attach, sg_table, direction);
-
-	if (dma_buf_pin_on_map(attach))
-		attach->dmabuf->ops->unpin(attach);
-}
-EXPORT_SYMBOL_NS_GPL(dma_buf_unmap_attachment, "DMA_BUF");
-
-/**
- * dma_buf_unmap_attachment_unlocked - unmaps and decreases usecount of the buffer;might
- * deallocate the scatterlist associated. Is a wrapper for unmap_dma_buf() of
- * dma_buf_ops.
- * @attach:	[in]	attachment to unmap buffer from
- * @sg_table:	[in]	scatterlist info of the buffer to unmap
- * @direction:	[in]	direction of DMA transfer
- *
- * Unlocked variant of dma_buf_unmap_attachment().
- */
-void dma_buf_unmap_attachment_unlocked(struct dma_buf_attachment *attach,
-				       struct sg_table *sg_table,
-				       enum dma_data_direction direction)
-{
-	might_sleep();
-
-	if (WARN_ON(!attach || !attach->dmabuf || !sg_table))
-		return;
-
 	dma_resv_lock(attach->dmabuf->resv, NULL);
-	dma_buf_unmap_attachment(attach, sg_table, direction);
+	dma_buf_unmap_sgt(attach, sg_table, direction);
 	dma_resv_unlock(attach->dmabuf->resv);
 }
-EXPORT_SYMBOL_NS_GPL(dma_buf_unmap_attachment_unlocked, "DMA_BUF");
+EXPORT_SYMBOL_NS_GPL(dma_buf_unmap_sgt_unlocked, "DMA_BUF");
 
 /**
  * dma_buf_attach_revocable - check if a DMA-buf importer implements
@@ -1395,6 +1515,10 @@ EXPORT_SYMBOL_NS_GPL(dma_buf_attach_revocable, "DMA_BUF");
  *
  * Importers are free to request a new mapping in parallel as this function
  * returns.
+ *
+ * This is also the only point at which an attachment's mapping type
+ * may change after a pin/map: the core keeps the type chosen by
+ * &dma_buf_ops.select_mapping until the attachment has been invalidated here.
  */
 void dma_buf_invalidate_mappings(struct dma_buf *dmabuf)
 {
@@ -1402,10 +1526,14 @@ void dma_buf_invalidate_mappings(struct dma_buf *dmabuf)
 
 	dma_resv_assert_held(dmabuf->resv);
 
-	list_for_each_entry(attach, &dmabuf->attachments, node)
-		if (attach->importer_ops &&
-		    attach->importer_ops->invalidate_mappings)
-			attach->importer_ops->invalidate_mappings(attach);
+	list_for_each_entry(attach, &dmabuf->attachments, node) {
+		if (!attach->importer_ops ||
+		    !attach->importer_ops->invalidate_mappings)
+			continue;
+
+		attach->selected = false;
+		attach->importer_ops->invalidate_mappings(attach);
+	}
 }
 EXPORT_SYMBOL_NS_GPL(dma_buf_invalidate_mappings, "DMA_BUF");
 
@@ -1790,7 +1918,13 @@ static int dma_buf_debug_show(struct seq_file *s, void *unused)
 		attach_count = 0;
 
 		list_for_each_entry(attach_obj, &buf_obj->attachments, node) {
-			seq_printf(s, "\t%s\n", dev_name(attach_obj->dev));
+			const struct dma_buf_mapping_type *type =
+				dma_buf_attach_map_type(attach_obj)->type;
+
+			seq_printf(s, "\t%s:", type->name);
+			if (type->debugfs_dump)
+				type->debugfs_dump(s, attach_obj);
+			seq_putc(s, '\n');
 			attach_count++;
 		}
 		dma_resv_unlock(buf_obj->resv);

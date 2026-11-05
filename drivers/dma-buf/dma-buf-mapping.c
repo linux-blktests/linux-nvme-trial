@@ -5,6 +5,8 @@
  */
 #include <linux/dma-buf-mapping.h>
 #include <linux/dma-resv.h>
+#include <linux/dma-buf.h>
+#include <linux/seq_file.h>
 #include <linux/overflow.h>
 #include <linux/align.h>
 
@@ -103,6 +105,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 					 size_t nr_ranges, size_t size,
 					 enum dma_data_direction dir)
 {
+	struct device *dma_dev = dma_buf_sgt_dma_device(attach);
 	struct dma_buf_dma *dma;
 	struct scatterlist *sgl;
 	size_t mapped_len = 0;
@@ -121,7 +124,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 	if (!dma)
 		return ERR_PTR(-ENOMEM);
 
-	switch (pci_p2pdma_map_type(provider, attach->dev)) {
+	switch (pci_p2pdma_map_type(provider, dma_dev)) {
 	case PCI_P2PDMA_MAP_BUS_ADDR:
 		/*
 		 * There is no need in IOVA at all for this flow.
@@ -134,7 +137,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 			goto err_free_dma;
 		}
 
-		dma_iova_try_alloc(attach->dev, dma->state, 0, size);
+		dma_iova_try_alloc(dma_dev, dma->state, 0, size);
 		break;
 	default:
 		ret = -EINVAL;
@@ -155,7 +158,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 			addr = pci_p2pdma_bus_addr_map(provider,
 						       phys_vec[i].paddr);
 		} else if (dma_use_iova(dma->state)) {
-			ret = dma_iova_link(attach->dev, dma->state,
+			ret = dma_iova_link(dma_dev, dma->state,
 					    phys_vec[i].paddr, 0,
 					    phys_vec[i].len, dir,
 					    DMA_ATTR_MMIO);
@@ -164,10 +167,10 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 
 			mapped_len += phys_vec[i].len;
 		} else {
-			addr = dma_map_phys(attach->dev, phys_vec[i].paddr,
+			addr = dma_map_phys(dma_dev, phys_vec[i].paddr,
 					    phys_vec[i].len, dir,
 					    DMA_ATTR_MMIO);
-			ret = dma_mapping_error(attach->dev, addr);
+			ret = dma_mapping_error(dma_dev, addr);
 			if (ret)
 				goto err_unmap_dma;
 		}
@@ -178,7 +181,7 @@ struct sg_table *dma_buf_phys_vec_to_sgt(struct dma_buf_attachment *attach,
 
 	if (dma->state && dma_use_iova(dma->state)) {
 		WARN_ON_ONCE(mapped_len != size);
-		ret = dma_iova_sync(attach->dev, dma->state, 0, mapped_len);
+		ret = dma_iova_sync(dma_dev, dma->state, 0, mapped_len);
 		if (ret)
 			goto err_unmap_dma;
 
@@ -205,11 +208,11 @@ err_unmap_dma:
 	if (!i || !dma->state) {
 		; /* Do nothing */
 	} else if (dma_use_iova(dma->state)) {
-		dma_iova_destroy(attach->dev, dma->state, mapped_len, dir,
+		dma_iova_destroy(dma_dev, dma->state, mapped_len, dir,
 				 DMA_ATTR_MMIO);
 	} else {
 		for_each_sgtable_dma_sg(&dma->sgt, sgl, i)
-			dma_unmap_phys(attach->dev, sg_dma_address(sgl),
+			dma_unmap_phys(dma_dev, sg_dma_address(sgl),
 				       sg_dma_len(sgl), dir, DMA_ATTR_MMIO);
 	}
 	sg_free_table(&dma->sgt);
@@ -234,6 +237,7 @@ void dma_buf_free_sgt(struct dma_buf_attachment *attach, struct sg_table *sgt,
 		      enum dma_data_direction dir)
 {
 	struct dma_buf_dma *dma = container_of(sgt, struct dma_buf_dma, sgt);
+	struct device *dma_dev = dma_buf_sgt_dma_device(attach);
 	int i;
 
 	dma_resv_assert_held(attach->dmabuf->resv);
@@ -241,13 +245,13 @@ void dma_buf_free_sgt(struct dma_buf_attachment *attach, struct sg_table *sgt,
 	if (!dma->state) {
 		; /* Do nothing */
 	} else if (dma_use_iova(dma->state)) {
-		dma_iova_destroy(attach->dev, dma->state, dma->size, dir,
+		dma_iova_destroy(dma_dev, dma->state, dma->size, dir,
 				 DMA_ATTR_MMIO);
 	} else {
 		struct scatterlist *sgl;
 
 		for_each_sgtable_dma_sg(sgt, sgl, i)
-			dma_unmap_phys(attach->dev, sg_dma_address(sgl),
+			dma_unmap_phys(dma_dev, sg_dma_address(sgl),
 				       sg_dma_len(sgl), dir, DMA_ATTR_MMIO);
 	}
 
@@ -257,3 +261,270 @@ void dma_buf_free_sgt(struct dma_buf_attachment *attach, struct sg_table *sgt,
 
 }
 EXPORT_SYMBOL_NS_GPL(dma_buf_free_sgt, "DMA_BUF");
+
+/**
+ * dma_buf_match_mapping - Record the mapping types agreed upon by exporter
+ *                         and importer
+ * @args: Match arguments from attach
+ * @exp: Array of mapping types supported by the exporter, in priority order
+ * @exp_len: Number of entries in @exp
+ *
+ * Walk the exporter's list in order and, for each entry, find the first
+ * importer entry of the same type that the type's match() callback accepts.
+ * Every such pair is recorded in @args->attach->matches, so the match set
+ * preserves the exporter's priority. The first entry is the default returned
+ * by dma_buf_attach_map_type() until &dma_buf_ops.select_mapping chooses
+ * otherwise at pin or map time.
+ *
+ * Because the exporter list is walked in order, the exporter controls the
+ * priority of mapping types.
+ *
+ * Returns: 0 if at least one type matched, -EOPNOTSUPP if the exporter and
+ * importer have no type in common, -EINVAL if either list is empty, -E2BIG if
+ * more than DMA_BUF_MAX_MATCHES types matched, or the error a match() callback
+ * aborted the search with.
+ */
+int dma_buf_match_mapping(struct dma_buf_match_args *args,
+			  const struct dma_buf_mapping_match *exp,
+			  size_t exp_len)
+{
+	const struct dma_buf_mapping_match *exp_end = exp + exp_len;
+	const struct dma_buf_mapping_match *imp_end =
+		args->imp_matches + args->imp_len;
+	struct dma_buf_attachment *attach = args->attach;
+	unsigned int nr = 0;
+	int ret;
+
+	if (!exp_len || !args->imp_len)
+		return -EINVAL;
+
+	for (; exp != exp_end; exp++) {
+		const struct dma_buf_mapping_match *imp = args->imp_matches;
+
+		for (; imp != imp_end; imp++) {
+			if (exp->type != imp->type)
+				continue;
+			if (exp->type->match) {
+				ret = exp->type->match(args, exp, imp);
+				if (ret == -EOPNOTSUPP)
+					continue;
+				if (ret != 0)
+					return ret;
+			}
+			if (nr == ARRAY_SIZE(attach->matches))
+				return -E2BIG;
+			exp->type->finish_match(args, exp, imp,
+						&attach->matches[nr++]);
+			break;
+		}
+	}
+
+	if (!nr)
+		return -EOPNOTSUPP;
+
+	attach->nr_matches = nr;
+	return 0;
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_match_mapping, "DMA_BUF");
+
+/**
+ * dma_buf_mapping_select - Let the exporter choose the type to map with
+ * @attach: Attachment about to be pinned or mapped
+ *
+ * Called with the dma_resv lock held by dma_buf_pin() and the map functions.
+ * The first call after attach, and after each dma_buf_invalidate_mappings(),
+ * calls &dma_buf_ops.select_mapping to pick an entry of the match set given
+ * the buffer's placement and the other live mappings. Exporters without the
+ * callback get the first entry. Every other call returns the previous choice
+ * unchanged, so the mapping type cannot change between unmap and remap without
+ * the exporter having explicitly invalidated.
+ *
+ * Returns: 0 on success or the exporter's error, typically -EBUSY when the
+ * attachment cannot be served without disturbing a mapping that cannot be
+ * invalidated.
+ */
+int dma_buf_mapping_select(struct dma_buf_attachment *attach)
+{
+	int idx = 0;
+
+	dma_resv_assert_held(attach->dmabuf->resv);
+
+	if (attach->selected)
+		return 0;
+
+	if (WARN_ON(!attach->nr_matches))
+		return -EINVAL;
+
+	if (attach->dmabuf->ops->select_mapping) {
+		idx = attach->dmabuf->ops->select_mapping(attach);
+		if (idx < 0)
+			return idx;
+		if (WARN_ON(idx >= attach->nr_matches))
+			return -EINVAL;
+	}
+
+	attach->selected_idx = idx;
+	attach->selected = true;
+	return 0;
+}
+
+/**
+ * dma_buf_mapping_unselect - Undo a selection that established nothing
+ * @attach: Attachment whose pin or map just failed
+ * @was_selected: attach->selected before the failed pin or map began
+ *
+ * A pin or map that fails after dma_buf_mapping_select() may reopen the
+ * choice only if it was the one that made it. A selection that predates the
+ * call belongs to a live pin or mapping and must survive, otherwise the next
+ * pin or map would reselect under it without an invalidate.
+ */
+void dma_buf_mapping_unselect(struct dma_buf_attachment *attach,
+			      bool was_selected)
+{
+	dma_resv_assert_held(attach->dmabuf->resv);
+
+	if (was_selected)
+		return;
+
+	attach->selected = false;
+	attach->selected_idx = 0;
+}
+
+/**
+ * dma_buf_mapping_map - Map an attachment with whichever type the exporter
+ *                       selects
+ * @attach: the attachment
+ * @dir: DMA direction
+ *
+ * For importers that listed more than one mapping type. The exporter picks the
+ * type from the possible matches and the result's &dma_buf_mapping.type records
+ * which was used. Must be called with the dma_resv lock held, and the lock must
+ * be held until the result has been acted on. Importers that listed a single
+ * type keep using that type's map function.
+ *
+ * Returns: a &struct dma_buf_mapping to pass to dma_buf_mapping_unmap(), or
+ * an ERR_PTR.
+ */
+struct dma_buf_mapping *dma_buf_mapping_map(struct dma_buf_attachment *attach,
+					    enum dma_data_direction dir)
+{
+	const struct dma_buf_mapping_type *type;
+	struct dma_buf_mapping *mapping;
+	bool selected;
+	int ret;
+
+	might_sleep();
+
+	if (WARN_ON(!attach || !attach->dmabuf))
+		return ERR_PTR(-EINVAL);
+
+	dma_resv_assert_held(attach->dmabuf->resv);
+
+	selected = attach->selected;
+	ret = dma_buf_mapping_select(attach);
+	if (ret)
+		return ERR_PTR(ret);
+
+	type = dma_buf_attach_map_type(attach)->type;
+	if (!type->map) {
+		ret = -EOPNOTSUPP;
+		goto err_release;
+	}
+
+	mapping = type->map(attach, dir);
+	if (IS_ERR(mapping)) {
+		ret = PTR_ERR(mapping);
+		goto err_release;
+	}
+
+	return mapping;
+
+err_release:
+	dma_buf_mapping_unselect(attach, selected);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_mapping_map, "DMA_BUF");
+
+/**
+ * dma_buf_mapping_unmap - Release a mapping from dma_buf_mapping_map()
+ * @attach: the attachment
+ * @mapping: what dma_buf_mapping_map() returned
+ * @dir: DMA direction used for the map
+ */
+void dma_buf_mapping_unmap(struct dma_buf_attachment *attach,
+			   struct dma_buf_mapping *mapping,
+			   enum dma_data_direction dir)
+{
+	might_sleep();
+
+	if (WARN_ON(!attach || !attach->dmabuf || !mapping))
+		return;
+
+	dma_resv_assert_held(attach->dmabuf->resv);
+
+	mapping->type->unmap(attach, mapping, dir);
+}
+EXPORT_SYMBOL_NS_GPL(dma_buf_mapping_unmap, "DMA_BUF");
+
+static int dma_buf_sgt_match(struct dma_buf_match_args *args,
+			     const struct dma_buf_mapping_match *exp,
+			     const struct dma_buf_mapping_match *imp)
+{
+	switch (exp->sgt_data.exporter_requires_p2p) {
+	case DMA_SGT_NO_P2P:
+		return 0;
+	case DMA_SGT_EXPORTER_REQUIRES_P2P:
+		if (imp->sgt_data.importer_accepts_p2p !=
+		    DMA_SGT_IMPORTER_ACCEPTS_P2P)
+			return -EOPNOTSUPP;
+		return 0;
+	case DMA_SGT_EXPORTER_REQUIRES_P2P_DISTANCE:
+		if (WARN_ON(!exp->sgt_data.exporting_p2p_device) ||
+		    imp->sgt_data.importer_accepts_p2p !=
+			    DMA_SGT_IMPORTER_ACCEPTS_P2P)
+			return -EOPNOTSUPP;
+		/*
+		 * Not verbose: failing to match P2P is normal when the
+		 * exporter also offers a system memory type.
+		 */
+		if (pci_p2pdma_distance(exp->sgt_data.exporting_p2p_device,
+					args->dev, false) < 0)
+			return -EOPNOTSUPP;
+		return 0;
+	}
+	return 0;
+}
+
+static inline void
+dma_buf_sgt_finish_match(struct dma_buf_match_args *args,
+			 const struct dma_buf_mapping_match *exp,
+			 const struct dma_buf_mapping_match *imp,
+			 struct dma_buf_mapping_match *match)
+{
+	*match = (struct dma_buf_mapping_match) {
+		.type = &dma_buf_mapping_sgt_type,
+		.exp_ops = exp->exp_ops,
+		.sgt_data = {
+			.importing_dma_device = args->dev,
+			/* exporting_p2p_device is left opaque */
+			.importer_accepts_p2p = imp->sgt_data.importer_accepts_p2p,
+			.exporter_requires_p2p = exp->sgt_data.exporter_requires_p2p,
+		},
+	};
+}
+
+static void dma_buf_sgt_debugfs_dump(struct seq_file *s,
+				     struct dma_buf_attachment *attach)
+{
+	seq_printf(s, " %s", dev_name(dma_buf_sgt_dma_device(attach)));
+}
+
+struct dma_buf_mapping_type dma_buf_mapping_sgt_type = {
+	.name = "DMA Mapped Scatter Gather Table",
+	.match = dma_buf_sgt_match,
+	.finish_match = dma_buf_sgt_finish_match,
+	.debugfs_dump = dma_buf_sgt_debugfs_dump,
+	.map = dma_buf_sgt_type_map,
+	.unmap = dma_buf_sgt_type_unmap,
+};
+EXPORT_SYMBOL_NS_GPL(dma_buf_mapping_sgt_type, "DMA_BUF");

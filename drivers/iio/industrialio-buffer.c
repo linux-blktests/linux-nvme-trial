@@ -16,6 +16,7 @@
 #include <linux/export.h>
 #include <linux/device.h>
 #include <linux/dma-buf.h>
+#include <linux/dma-buf-mapping.h>
 #include <linux/dma-fence.h>
 #include <linux/dma-resv.h>
 #include <linux/file.h>
@@ -1593,7 +1594,7 @@ static void iio_buffer_dmabuf_release(struct kref *ref)
 	struct iio_buffer *buffer = priv->buffer;
 	struct dma_buf *dmabuf = attach->dmabuf;
 
-	dma_buf_unmap_attachment_unlocked(attach, priv->sgt, priv->dir);
+	dma_buf_unmap_sgt_unlocked(attach, priv->sgt, priv->dir);
 
 	buffer->access->detach_dmabuf(buffer, priv->block);
 
@@ -1676,7 +1677,7 @@ iio_buffer_find_attachment(struct iio_dev_buffer_pair *ib,
 	guard(mutex)(&buffer->dmabufs_mutex);
 
 	list_for_each_entry(priv, &buffer->dmabufs, entry) {
-		if (priv->attach->dev == dma_dev
+		if (dma_buf_sgt_dma_device(priv->attach) == dma_dev
 		    && priv->attach->dmabuf == dmabuf) {
 			attach = priv->attach;
 			break;
@@ -1733,7 +1734,7 @@ static int iio_buffer_attach_dmabuf(struct iio_dev_buffer_pair *ib,
 	priv->dir = buffer->direction == IIO_BUFFER_DIRECTION_IN
 		? DMA_FROM_DEVICE : DMA_TO_DEVICE;
 
-	priv->sgt = dma_buf_map_attachment(attach, priv->dir);
+	priv->sgt = dma_buf_map_sgt(attach, priv->dir);
 	if (IS_ERR(priv->sgt)) {
 		err = PTR_ERR(priv->sgt);
 		dev_err(&indio_dev->dev, "Unable to map attachment: %d\n", err);
@@ -1760,7 +1761,7 @@ static int iio_buffer_attach_dmabuf(struct iio_dev_buffer_pair *ib,
 	 * combo. If we do, refuse to attach.
 	 */
 	list_for_each_entry(each, &buffer->dmabufs, entry) {
-		if (each->attach->dev == dma_dev
+		if (dma_buf_sgt_dma_device(each->attach) == dma_dev
 		    && each->attach->dmabuf == dmabuf) {
 			/*
 			 * We unlocked the reservation object, so going through
@@ -1781,7 +1782,7 @@ static int iio_buffer_attach_dmabuf(struct iio_dev_buffer_pair *ib,
 	return 0;
 
 err_dmabuf_unmap_attachment:
-	dma_buf_unmap_attachment(attach, priv->sgt, priv->dir);
+	dma_buf_unmap_sgt(attach, priv->sgt, priv->dir);
 err_resv_unlock:
 	dma_resv_unlock(dmabuf->resv);
 err_dmabuf_detach:
@@ -1814,7 +1815,7 @@ static int iio_buffer_detach_dmabuf(struct iio_dev_buffer_pair *ib,
 	guard(mutex)(&buffer->dmabufs_mutex);
 
 	list_for_each_entry(priv, &buffer->dmabufs, entry) {
-		if (priv->attach->dev == dma_dev
+		if (dma_buf_sgt_dma_device(priv->attach) == dma_dev
 		    && priv->attach->dmabuf == dmabuf) {
 			list_del(&priv->entry);
 
